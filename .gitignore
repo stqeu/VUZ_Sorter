@@ -1,0 +1,50 @@
+# =============================================================================
+# BEZPEČNOSŤ DÁT – do repa nesmú ísť reálne dokumenty ani MasterData firmy.
+# Všetky dokumenty sa ignorujú; výnimkou sú iba fiktívne súbory v demo_data/.
+# =============================================================================
+*.pdf
+*.doc
+*.docx
+*.rtf
+*.xls
+*.xlsx
+*.xlsm
+*.csv
+*.txt
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.dwg
+*.dxf
+*.msg
+*.zip
+*.7z
+!requirements.txt
+!demo_data/**
+
+# reálne konfigurácie (cesty na OneDrive, názvy projektov)
+config/*.local.ini
+
+# výstupy skriptu (kópie dokumentov, odkazy, protokoly, cache s textom dokumentov)
+vystup/
+vystup_*/
+*.sqlite
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Office / Windows / editory
+~$*
+!demo_data/**/~$*
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

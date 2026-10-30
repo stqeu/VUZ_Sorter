@@ -1,0 +1,14 @@
+# jednotné konce riadkov (dvaja ľudia, Windows)
+* text=auto
+*.py   text eol=lf
+*.md   text eol=lf
+*.ini  text eol=lf
+*.yml  text eol=lf
+*.bat  text eol=crlf
+
+# binárne súbory – git ich nemá meniť ani porovnávať ako text
+*.xlsx binary
+*.docx binary
+*.pdf  binary
+*.jpg  binary
+*.dwg  binary

@@ -1,0 +1,23 @@
+name: testy
+
+# Spustí sa pri každom pull requeste do main a pri každom pushi do main.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  testy:
+    runs-on: windows-latest          # rovnaké prostredie ako u nás (Windows, .lnk odkazy)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Inštalácia
+        run: pip install -r requirements.txt
+      - name: Testy pravidiel a celého behu
+        run: python -m unittest discover testy -v
+      - name: Ostrý beh na demo dátach (vrátane .lnk skratiek)
+        run: python lta_triedenie.py --config config/demo.ini --ostro

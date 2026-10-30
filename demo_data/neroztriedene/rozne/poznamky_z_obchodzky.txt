@@ -1,0 +1,5 @@
+Obchôdzka 4. 5. 2024
+- na V109A presakuje príruba (bez predpony jednotky)
+- PLUG-VALVE-1 ťažko ide
+- 11V1090 a 11E1011 nie sú naše zariadenia (test hraníc)
+- nádrž 11V109 v prevádzke bez problémov
