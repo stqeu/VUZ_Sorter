@@ -17,7 +17,8 @@ Použitie:
     python lta_triedenie.py --ostro                 -> ostrý beh
     python lta_triedenie.py --config config/rhc.local.ini   -> reálny projekt
 
-OCR zatiaľ nie je súčasťou. Súbory a strany bez textu sa označia ako „potrebuje OCR“.
+OCR (lokálne): skeny a obrázky sa prečítajú cez Tesseract / OCRmyPDF, ak sú nainštalované.
+Bez nich skript beží ďalej a súbory označí ako „potrebuje OCR“.
 """
 
 from __future__ import annotations
@@ -41,8 +42,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERZIA = "0.1.0-demo"
-VERZIA_EXTRAKCIE = 1  # zvýš, ak sa zmení spôsob čítania textu -> cache sa prepočíta
+VERZIA = "0.2.0-ocr"
+VERZIA_EXTRAKCIE = 2  # zvýš, ak sa zmení spôsob čítania textu -> cache sa prepočíta
 
 log = logging.getLogger("lta")
 
@@ -79,6 +80,7 @@ class Nastavenia:
     nejednoznacne_navyse: list[str]
     povolit_bez_predpony: bool
     harky: list[HarokNastavenie] = field(default_factory=list)
+    ocr: "OcrNastavenie" = None  # type: ignore[assignment]
 
 
 def _ano(hodnota: str) -> bool:
@@ -128,6 +130,18 @@ def nacitaj_nastavenia(cesta: Path) -> Nastavenia:
             priecinok=s.get("priecinok", nazov),
             potrubia=_ano(s.get("potrubia", "nie")),
         ))
+    o = cp["ocr"] if cp.has_section("ocr") else {}
+    n.ocr = OcrNastavenie(
+        zapnute=_ano(o.get("zapnute", "ano")),
+        jazyky=o.get("jazyky", "slk+ces+eng").strip(),
+        tesseract=o.get("tesseract", "").strip(),
+        pouzit_ocrmypdf=_ano(o.get("ocrmypdf", "ano")),
+        prehladavatelne_pdf=_ano(o.get("prehladavatelne_pdf", "ano")),
+        oprava_zamien=_ano(o.get("oprava_zamien", "ano")),
+        max_stran=int(o.get("max_stran", 200)),
+        casovy_limit_s=int(o.get("casovy_limit_s", 900)),
+        paralelne=int(o.get("paralelne", 2)),
+    )
     if n.ulozisko not in {"kopia", "zdroj"}:
         raise SystemExit("ulozisko musí byť 'kopia' alebo 'zdroj'")
     return n
@@ -324,6 +338,21 @@ def _kotva(tag: str) -> str | None:
     """Najdlhšia číselná skupina – rýchly predfilter (netreba skúšať 8 700 regexov na každý text)."""
     cisla = re.findall(r"\d+", tag)
     return max(cisla, key=len) if cisla else None
+
+
+# Typické zámeny OCR: znaky v jednej skupine sa pri OCR zhode považujú za rovnaké.
+# Text aj tag sa prevedú na „kostru“ rovnakej dĺžky (pozície ostávajú) a porovnajú sa kostry.
+ZAMENY_OCR = str.maketrans({"O": "0", "o": "0", "D": "0", "Q": "0", "C": "0",
+                            "I": "1", "l": "1", "|": "1", "!": "1",
+                            "S": "5", "s": "5", "B": "8", "Z": "2", "z": "2", "G": "6",
+                            "£": "E", "€": "E"})
+
+
+def parovac_zamen(tagy: dict[str, "Tag"], n: "Nastavenia") -> "Parovac":
+    """Párovač nad kostrami tagov – na nájdenie '11V1O9A' (OCR) ako 11V109A. Zhody idú na kontrolu."""
+    kostry = {k: Tag(k, t.zobrazenie.translate(ZAMENY_OCR), list(t.harky), set(), t.potrubie, t.nejednoznacny)
+              for k, t in tagy.items()}
+    return Parovac(kostry, n)
 
 
 @dataclass
@@ -531,12 +560,23 @@ class CitacTextu:
                 import fitz as pymupdf  # type: ignore
             except ImportError:
                 pymupdf = None
-        if pymupdf is not None:
-            with pymupdf.open(cesta) as doc:
-                return [(str(i + 1), p.get_text("text", sort=True)) for i, p in enumerate(doc)]
         from pypdf import PdfReader
-        r = PdfReader(str(cesta))
-        return [(str(i + 1), p.extract_text() or "") for i, p in enumerate(r.pages)]
+        if pymupdf is None:
+            r = PdfReader(str(cesta))
+            return [(str(i + 1), p.extract_text() or "") for i, p in enumerate(r.pages)]
+        with pymupdf.open(cesta) as doc:
+            strany = [(str(i + 1), p.get_text("text", sort=True)) for i, p in enumerate(doc)]
+        # PyMuPDF pri niektorých stranách (napr. otočená strana s OCR vrstvou) vráti prázdny text –
+        # takú stranu skúsime prečítať aj cez pypdf
+        prazdne = [i for i, (_, t) in enumerate(strany) if not t.strip()]
+        if prazdne:
+            try:
+                r = PdfReader(str(cesta))
+                for i in prazdne:
+                    strany[i] = (strany[i][0], r.pages[i].extract_text() or "")
+            except Exception:  # noqa: BLE001 – záloha, pôvodný (prázdny) výsledok ostáva
+                pass
+        return strany
 
     @staticmethod
     def _docx(cesta: Path) -> str:
@@ -637,6 +677,9 @@ class Cache:
             CREATE TABLE IF NOT EXISTS subory(cesta TEXT PRIMARY KEY, velkost INT, mtime REAL, hash TEXT);
             CREATE TABLE IF NOT EXISTS texty(hash TEXT, verzia INT, poradie INT, strana TEXT, text TEXT);
             CREATE TABLE IF NOT EXISTS extrakcia(hash TEXT PRIMARY KEY, verzia INT, chyba TEXT);
+            CREATE TABLE IF NOT EXISTS ocr_texty(hash TEXT, strana TEXT, text TEXT);
+            CREATE TABLE IF NOT EXISTS ocr(hash TEXT PRIMARY KEY, verzia INT, jazyky TEXT, motor TEXT,
+                                           chyba TEXT, pdf INT);
         """)
 
     def hash_suboru(self, cesta: Path) -> str:
@@ -665,8 +708,240 @@ class Cache:
                             [(hx, VERZIA_EXTRAKCIE, i, s, t) for i, (s, t) in enumerate(strany)])
         self.db.execute("INSERT OR REPLACE INTO extrakcia VALUES(?,?,?)", (hx, VERZIA_EXTRAKCIE, chyba))
 
+    def ocr(self, hx: str, jazyky: str):
+        r = self.db.execute("SELECT verzia, jazyky, motor, chyba, pdf FROM ocr WHERE hash=?", (hx,)).fetchone()
+        if not r or r[0] != VERZIA_OCR or r[1] != jazyky:
+            return None
+        strany = dict(self.db.execute("SELECT strana, text FROM ocr_texty WHERE hash=?", (hx,)).fetchall())
+        return strany, r[2], r[3], bool(r[4])
+
+    def uloz_ocr(self, hx: str, jazyky: str, strany: dict, motor: str, chyba: str | None, pdf: bool):
+        self.db.execute("DELETE FROM ocr_texty WHERE hash=?", (hx,))
+        self.db.executemany("INSERT INTO ocr_texty VALUES(?,?,?)", [(hx, s, t) for s, t in strany.items()])
+        self.db.execute("INSERT OR REPLACE INTO ocr VALUES(?,?,?,?,?,?)",
+                        (hx, VERZIA_OCR, jazyky, motor, chyba, int(pdf)))
+
     def commit(self):
         self.db.commit()
+
+
+# =============================================================================
+# 5b. OCR – lokálne (Tesseract, OCRmyPDF). Nič neodchádza mimo počítača.
+# =============================================================================
+
+VERZIA_OCR = 3  # zvýš, ak sa zmení spôsob OCR -> výsledky v cache sa prepočítajú
+
+TESSERACT_WINDOWS = [
+    Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+    Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tesseract.exe",
+]
+
+
+@dataclass
+class OcrNastavenie:
+    zapnute: bool = True
+    jazyky: str = "slk+ces+eng"
+    tesseract: str = ""               # prázdne = nájde sám
+    pouzit_ocrmypdf: bool = True      # PDF cez OCRmyPDF (vyrobí aj prehľadávateľné PDF)
+    prehladavatelne_pdf: bool = True  # odkaz pri tagu povedie na prehľadávateľnú verziu skenu
+    oprava_zamien: bool = True        # O/0, I/1, S/5, B/8 ... -> zhoda na kontrolu
+    max_stran: int = 200
+    casovy_limit_s: int = 900
+    paralelne: int = 2
+    dpi: int = 300
+
+
+class Ocr:
+    """Zistí, čo je nainštalované, a spúšťa OCR. Ak nič nie je, skript beží ďalej bez OCR."""
+
+    def __init__(self, ns: OcrNastavenie):
+        self.ns = ns
+        self.tesseract: Path | None = None
+        self.jazyky = ""
+        self.ocrmypdf = False
+        self.psm = "3"
+        self._varovane_argumenty = False
+        self.dovod = ""
+        if not ns.zapnute:
+            self.dovod = "OCR je vypnuté v nastaveniach"
+            return
+        self.tesseract = self._najdi_tesseract()
+        if not self.tesseract:
+            self.dovod = "Tesseract nie je nainštalovaný (alebo ho nenašiel)"
+            return
+        dostupne = self._jazyky()
+        chcene = [j for j in ns.jazyky.split("+") if j]
+        ok = [j for j in chcene if j in dostupne]
+        chyba = [j for j in chcene if j not in dostupne]
+        if chyba:
+            log.warning("OCR: v Tesseracte chýbajú jazyky %s – používam %s", "+".join(chyba), "+".join(ok) or "eng")
+        self.jazyky = "+".join(ok) or "eng"
+        self.psm = "1" if "osd" in dostupne else "3"   # 1 = rozpozná aj otočené strany
+        if ns.pouzit_ocrmypdf:
+            import importlib.util
+            self.ocrmypdf = importlib.util.find_spec("ocrmypdf") is not None
+
+    @property
+    def dostupne(self) -> bool:
+        return self.tesseract is not None
+
+    @property
+    def popis(self) -> str:
+        if not self.dostupne:
+            return f"nedostupné – {self.dovod}"
+        return f"Tesseract ({self.jazyky})" + (" + OCRmyPDF" if self.ocrmypdf else " (bez OCRmyPDF)")
+
+    def _najdi_tesseract(self) -> Path | None:
+        if self.ns.tesseract:
+            p = Path(self.ns.tesseract)
+            return p if p.is_file() else None
+        kde = shutil.which("tesseract")
+        if kde:
+            return Path(kde)
+        return next((p for p in TESSERACT_WINDOWS if p.is_file()), None)
+
+    def _env(self) -> dict:
+        env = dict(os.environ)
+        env["PATH"] = str(self.tesseract.parent) + os.pathsep + env.get("PATH", "")   # aby ho našiel aj OCRmyPDF
+        env.setdefault("OMP_THREAD_LIMIT", "1")
+        return env
+
+    def _jazyky(self) -> set[str]:
+        r = subprocess.run([str(self.tesseract), "--list-langs"], capture_output=True, timeout=60)
+        riadky = (r.stdout or b"").decode("utf-8", "ignore").splitlines()
+        return {x.strip() for x in riadky[1:] if x.strip()}
+
+    # -------------------------------------------------------------- obrázok
+    def obrazok(self, cesta: Path) -> str:
+        r = subprocess.run([str(self.tesseract), str(cesta), "stdout", "-l", self.jazyky, "--psm", self.psm],
+                           capture_output=True, timeout=self.ns.casovy_limit_s, env=self._env())
+        if r.returncode != 0:
+            raise RuntimeError(f"Tesseract: {(r.stderr or b'').decode('utf-8', 'ignore').strip()[:300]}")
+        return (r.stdout or b"").decode("utf-8", "ignore")
+
+    # -------------------------------------------------------------- PDF
+    def pdf(self, cesta: Path, strany_bez_textu: list[str], vystup_pdf: Path) -> tuple[dict[str, str], str, bool]:
+        """Vráti ({strana: text}, motor, vytvorene_prehladavatelne_pdf)."""
+        if self.ocrmypdf:
+            try:
+                return self._ocrmypdf(cesta, vystup_pdf), "OCRmyPDF", True
+            except Exception as e:  # noqa: BLE001
+                log.warning("   OCRmyPDF zlyhal (%s) – skúšam priamo Tesseract", str(e)[:200])
+        return self._vykresli_a_rozpoznaj(cesta, strany_bez_textu), "Tesseract", False
+
+    def _ocrmypdf(self, cesta: Path, vystup_pdf: Path) -> dict[str, str]:
+        vystup_pdf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = vystup_pdf.with_suffix(".tmp.pdf")
+        prikaz = [sys.executable, "-m", "ocrmypdf",
+                  "-l", self.jazyky,
+                  "--skip-text",            # OCR iba na stranách bez textu
+                  "--rotate-pages",         # otočené skeny
+                  "--rotate-pages-threshold", "2",       # predvolený prah je prísny – otočený sken neotočil
+                  "--tesseract-pagesegmode", self.psm,   # 1 = Tesseract sám rozpozná orientáciu
+                  "--optimize", "0",        # neprekomprimovať obrázky (archív)
+                  "--output-type", "pdf",
+                  "--jobs", str(max(1, self.ns.paralelne)),
+                  "--quiet",
+                  str(cesta), str(tmp)]
+        r = subprocess.run(prikaz, capture_output=True, timeout=self.ns.casovy_limit_s, env=self._env())
+        if r.returncode != 0 or not tmp.is_file():
+            chyba = (r.stderr or b'').decode('utf-8', 'ignore').strip()
+            if r.returncode == 2 and not self._varovane_argumenty:   # zlé argumenty = problém verzie OCRmyPDF
+                self._varovane_argumenty = True
+                log.warning("OCRmyPDF odmietol argumenty – skeny pôjdu priamo cez Tesseract (bez prehľadávateľného PDF).")
+            raise RuntimeError(f"kód {r.returncode}: {chyba[-300:]}")
+        tmp.replace(vystup_pdf)
+        # text čítame z výsledného PDF – zachová čísla strán (pôvodný text + OCR vrstva)
+        return {s: t for s, t in CitacTextu._pdf(vystup_pdf)}
+
+    def _vykresli_a_rozpoznaj(self, cesta: Path, strany: list[str]) -> dict[str, str]:
+        vys: dict[str, str] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            for s in strany[: self.ns.max_stran]:
+                obr = Path(tmp) / f"s{s}.png"
+                if _vykresli_stranu(cesta, int(s) - 1, obr, self.ns.dpi):
+                    vys[s] = self.obrazok(obr)
+        return vys
+
+
+def _vykresli_stranu(pdf: Path, index: int, ciel: Path, dpi: int) -> bool:
+    """Strana PDF -> PNG. Skúsi PyMuPDF, potom pypdfium2, nakoniec vložený obrázok cez pypdf."""
+    try:
+        import pymupdf  # type: ignore
+    except ImportError:
+        try:
+            import fitz as pymupdf  # type: ignore
+        except ImportError:
+            pymupdf = None
+    if pymupdf is not None:
+        with pymupdf.open(pdf) as doc:
+            doc[index].get_pixmap(dpi=dpi).save(str(ciel))
+        return True
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+        doc = pdfium.PdfDocument(str(pdf))
+        try:
+            doc[index].render(scale=dpi / 72).to_pil().save(ciel)
+        finally:
+            doc.close()
+        return True
+    except ImportError:
+        pass
+    from pypdf import PdfReader
+    obr = PdfReader(str(pdf)).pages[index].images
+    if not obr:
+        return False
+    obr[0].image.save(ciel)
+    return True
+
+
+def spusti_ocr(dokumenty: dict[str, Dokument], texty: dict[str, list[tuple[str, str]]],
+               cache: Cache, ocr: Ocr, n: Nastavenia) -> int:
+    """Doplní text z OCR do `texty` (iba strany bez textu). Vráti počet nových OCR (bez cache)."""
+    kandidati = [d for d in dokumenty.values() if d.stav in {"potrebuje OCR", "čiastočne OCR"}]
+    if not kandidati:
+        return 0
+    if not ocr.dostupne:
+        log.warning("OCR %s – %d dokumentov ostáva „potrebuje OCR“.", ocr.popis, len(kandidati))
+        return 0
+    log.info("OCR: %s | dokumentov na OCR: %d", ocr.popis, len(kandidati))
+    pdf_dir = n.vystup / ".cache" / "ocr"
+    nove = 0
+    for i, d in enumerate(kandidati, 1):
+        ulozene = cache.ocr(d.hash, ocr.jazyky)
+        if ulozene is None:
+            log.info("OCR [%d/%d] %s (strán: %d)", i, len(kandidati), d.nazov, len(d.strany_bez_textu))
+            strany, motor, chyba, ma_pdf = {}, "", None, False
+            try:
+                if d.pripona == ".pdf":
+                    strany, motor, ma_pdf = ocr.pdf(d.zdroje[0], d.strany_bez_textu, pdf_dir / f"{d.hash}.pdf")
+                else:
+                    strany, motor = {"1": ocr.obrazok(d.zdroje[0])}, "Tesseract"
+            except Exception as e:  # noqa: BLE001
+                chyba = f"{type(e).__name__}: {e}"[:500]
+            cache.uloz_ocr(d.hash, ocr.jazyky, strany, motor, chyba, ma_pdf)
+            cache.commit()
+            nove += 1
+        else:
+            strany, motor, chyba, ma_pdf = ulozene
+        d.ocr_motor = motor
+        if chyba:
+            d.stav, d.chyba = "chyba OCR", chyba
+            continue
+        # zlúčiť: pôvodný text strany ostáva, ak ho bolo dosť; inak text z OCR
+        nove_texty = []
+        for s, t in texty.get(d.hash, []) or [(s, "") for s in strany]:
+            if s in d.strany_bez_textu and strany.get(s, "").strip():
+                nove_texty.append((s, strany[s]))
+                d.ocr_strany.add(s)
+            else:
+                nove_texty.append((s, t))
+        texty[d.hash] = nove_texty
+        if ma_pdf and n.ocr.prehladavatelne_pdf and (pdf_dir / f"{d.hash}.pdf").is_file():
+            d.ocr_pdf = pdf_dir / f"{d.hash}.pdf"
+        d.stav = "OK (OCR)" if d.ocr_strany else "OCR bez textu"
+    return nove
 
 
 # =============================================================================
@@ -679,10 +954,14 @@ class Dokument:
     nazov: str                         # názov prvého nájdeného súboru
     pripona: str
     zdroje: list[Path] = field(default_factory=list)
-    stav: str = ""                     # OK | potrebuje OCR | čiastočne OCR | chyba
+    stav: str = ""                     # OK | OK (OCR) | potrebuje OCR | čiastočne OCR | OCR bez textu | chyba
     chyba: str = ""
     strany_bez_textu: list[str] = field(default_factory=list)
-    ulozene: Path | None = None        # kde leží jediná kópia
+    ulozene: Path | None = None        # kam vedú odkazy (pri skene prehľadávateľná verzia)
+    ulozene_original: Path | None = None
+    ocr_strany: set = field(default_factory=set)
+    ocr_motor: str = ""
+    ocr_pdf: Path | None = None        # prehľadávateľné PDF z OCRmyPDF (v cache)
 
 
 @dataclass
@@ -768,7 +1047,8 @@ def _kontext(text: str, z: int, k: int, okolie: int = 45) -> str:
 
 
 def paruj(dokumenty: dict[str, Dokument], texty: dict[str, list[tuple[str, str]]],
-          parovac: Parovac, tagy: dict[str, Tag], zdroje: list[Path]) -> dict[tuple[str, str], Vazba]:
+          parovac: Parovac, tagy: dict[str, Tag], zdroje: list[Path],
+          parovac_ocr: Parovac | None = None) -> dict[tuple[str, str], Vazba]:
     vazby: dict[tuple[str, str], Vazba] = {}
 
     def pridaj(kluc, hx, typ, strana, najdene, kontext):
@@ -796,8 +1076,21 @@ def paruj(dokumenty: dict[str, Dokument], texty: dict[str, list[tuple[str, str]]
         # obsah
         for strana, text in texty.get(d.hash, []):
             t = normalizuj_text(text)
-            for z in parovac.najdi(t):
+            z_ocr = strana in d.ocr_strany
+            najdene = parovac.najdi(t)
+            for z in najdene:
                 pridaj(z.kluc, d.hash, z.typ, strana, z.text, _kontext(t, z.zaciatok, z.koniec))
+                if z_ocr:
+                    vazby[(z.kluc, d.hash)].typy.add("z OCR")
+            # OCR zámeny (11V1O9A -> 11V109A): iba na stranách z OCR, vždy na kontrolu
+            if z_ocr and parovac_ocr is not None:
+                for z in parovac_ocr.najdi(t.translate(ZAMENY_OCR)):
+                    # ak tu už je presne prečítaný tag (ten istý alebo iný), nič nenavrhujeme
+                    if any((y.kluc == z.kluc and y.zaciatok < z.koniec and z.zaciatok < y.koniec)
+                           or (y.zaciatok <= z.zaciatok and y.koniec >= z.koniec) for y in najdene):
+                        continue
+                    povodny = t[z.zaciatok:z.koniec]
+                    pridaj(z.kluc, d.hash, "OCR oprava", strana, povodny, _kontext(t, z.zaciatok, z.koniec))
 
     # stav väzby
     for v in vazby.values():
@@ -896,7 +1189,7 @@ def zvol_typ_odkazu(n: Nastavenia) -> str:
         return "url"
 
 
-PRIPONA_ODKAZU = {"lnk": ".lnk", "url": ".url", "symlink": ""}
+PRIPONA_ODKAZU = {"lnk": ".lnk", "url": ".url", "symlink": "", "markdown": ""}
 _LNK_OK: bool | None = None
 
 
@@ -960,9 +1253,14 @@ def synchronizuj_odkazy(plan: dict[Path, Path], n: Nastavenia, vsetky_priecinky:
             o.unlink()
             zmazane += 1
 
-    nove = [(o, c) for o, c in plan.items()
-            if stary.get(str(o)) != str(c) or not (o.is_symlink() or o.exists())]
-    if typ == "lnk":
+    if typ == "markdown":   # odkazy sú v README.md priečinkov (zapis_markdown), súbory sa nevytvárajú
+        nove = [(o, c) for o, c in plan.items() if stary.get(str(o)) != str(c)]
+    else:
+        nove = [(o, c) for o, c in plan.items()
+                if stary.get(str(o)) != str(c) or not (o.is_symlink() or o.exists())]
+    if typ == "markdown":
+        pass
+    elif typ == "lnk":
         _vytvor_lnk_davkovo(nove)
     else:
         for o, c in nove:
@@ -987,13 +1285,128 @@ def uloz_dokumenty(dokumenty: dict[str, Dokument], potrebne: set[str], n: Nastav
         if d.hash not in potrebne:
             d.ulozene = d.zdroje[0]
             continue
-        d.ulozene = ulozisko_cesta(d, n)
+        d.ulozene = d.ulozene_original = ulozisko_cesta(d, n)
         if ostro and n.ulozisko == "kopia" and not d.ulozene.exists():
             d.ulozene.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(d.zdroje[0], d.ulozene)
             nove += 1
+        if d.ocr_pdf is not None:
+            # prehľadávateľná verzia skenu vedľa originálu; odkazy povedú na ňu
+            priecinok = n.vystup / ("_dokumenty" if n.ulozisko == "kopia" else "_ocr")
+            ocr_ciel = priecinok / f"{bezpecny_nazov(Path(d.nazov).stem)[:80]}__{d.hash[:8]}.ocr.pdf"
+            if ostro and not ocr_ciel.exists():
+                ocr_ciel.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(d.ocr_pdf, ocr_ciel)
+            d.ulozene = ocr_ciel
     return nove
 
+
+
+# ---------------------------------------------------------------------------- Markdown (čitateľné na GitHube)
+
+def _md(text) -> str:
+    return str(text if text is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def _md_odkaz(text: str, ciel: Path, od: Path) -> str:
+    return f"[{_md(text)}](<{_rel(ciel, od).replace(os.sep, '/')}>)"
+
+
+def _zapis_ak_iny(cesta: Path, obsah: str) -> bool:
+    """Zapíše iba pri zmene – opakovaný beh nemení súbory (žiadne zbytočné zmeny v gite)."""
+    if cesta.is_file() and cesta.read_text(encoding="utf-8") == obsah:
+        return False
+    cesta.parent.mkdir(parents=True, exist_ok=True)
+    cesta.write_text(obsah, encoding="utf-8")
+    return True
+
+
+def zapis_markdown(n: Nastavenia, tagy, dokumenty, vazby, readme_v_priecinkoch: bool) -> int:
+    """PREHLAD.md vo výstupe + (v režime markdown) README.md v každom priečinku tagu. Vráti počet zmenených."""
+    priecinky = {h.nazov: h.priecinok for h in n.harky}
+    koren = n.vystup
+    po_tagu: dict[str, list[Vazba]] = defaultdict(list)
+    for v in vazby.values():
+        po_tagu[v.kluc].append(v)
+    zmenene = 0
+
+    def zlozka(t: Tag, harok: str) -> Path:
+        return koren / "zariadenia" / priecinky[harok] / nazov_priecinka(t, harok, n)
+
+    if readme_v_priecinkoch:
+        for k, zoznam in po_tagu.items():
+            t = tagy[k]
+            pripojene = sorted((v for v in zoznam if v.stav in {"auto", "potvrdené"}),
+                               key=lambda v: dokumenty[v.hash].nazov.lower())
+            kontrola = sorted((v for v in zoznam if v.stav == "na kontrolu"),
+                              key=lambda v: dokumenty[v.hash].nazov.lower())
+            if not pripojene and not kontrola:
+                continue
+            for harok in t.harky:
+                z = zlozka(t, harok)
+                r = [f"# {_md(t.zobrazenie)}", "",
+                     f"Hárok **{_md(harok)}** · dokumentov: **{len(pripojene)}** · na kontrolu: {len(kontrola)} · "
+                     f"{_md_odkaz('← celý prehľad', koren / 'PREHLAD.md', z)}", ""]
+                if pripojene:
+                    r += ["Každý dokument je uložený iba raz v `_dokumenty` – tu sú len odkazy.", "",
+                          "| Dokument | Strany | Typ zhody | Nájdený text |", "|---|---|---|---|"]
+                    for v in pripojene:
+                        d = dokumenty[v.hash]
+                        r.append(f"| {_md_odkaz(d.nazov, d.ulozene, z)} | {_md(', '.join(sorted(v.strany)))} | "
+                                 f"{_md(', '.join(sorted(v.typy)))} | {_md(', '.join(sorted(v.texty)))} |")
+                if kontrola:
+                    r += ["", "## Čaká na kontrolu", "",
+                          "Nejasné zhody – rozhoduje sa v `kontrola.xlsx` (A = priradiť, N = nepriradiť).", "",
+                          "| Dokument | Typ zhody | Nájdený text | Kontext |", "|---|---|---|---|"]
+                    for v in kontrola:
+                        d = dokumenty[v.hash]
+                        r.append(f"| {_md_odkaz(d.nazov, d.ulozene or d.zdroje[0], z)} | "
+                                 f"{_md(', '.join(sorted(v.typy)))} | {_md(', '.join(sorted(v.texty)))} | "
+                                 f"{_md(v.kontext[:120])} |")
+                zmenene += _zapis_ak_iny(z / "README.md", "\n".join(r) + "\n")
+
+    # PREHLAD.md
+    pripojene_v = [v for v in vazby.values() if v.stav in {"auto", "potvrdené"}]
+    suborov = sum(len(d.zdroje) for d in dokumenty.values())
+    po_starom = sum(len(dokumenty[v.hash].zdroje) for v in pripojene_v)
+    r = [f"# Prehľad – {_md(n.projekt)}", "",
+         f"Vygenerované nástrojom VUZ Sorter {VERZIA}. Každý dokument je uložený **raz**, "
+         "zariadenia naň iba odkazujú.", "",
+         "## Súhrn", "",
+         "| Položka | Hodnota |", "|---|---|",
+         f"| Súborov v zdrojoch | {suborov} |",
+         f"| Unikátnych dokumentov (podľa obsahu) | {len(dokumenty)} |",
+         f"| Duplicitné kópie v zdrojoch | {suborov - len(dokumenty)} |",
+         f"| Dokumenty prečítané cez OCR | {sum(1 for d in dokumenty.values() if d.ocr_strany)} |",
+         f"| Tagov s aspoň jedným dokumentom | {len({v.kluc for v in pripojene_v})} |",
+         f"| Pôvodný postup (kópia do každého tagu) | {po_starom} súborov |",
+         f"| Teraz: dokumentov v úložisku | {len({v.hash for v in vazby.values()})} |",
+         f"| Teraz: väzieb tag ↔ dokument | {len(pripojene_v)} |",
+         f"| Na kontrolu | {sum(1 for v in vazby.values() if v.stav == 'na kontrolu')} |", "",
+         "## Zariadenia", "",
+         "| Hárok | Tag No | Dokumentov | Na kontrolu |", "|---|---|---|---|"]
+    for t in sorted(tagy.values(), key=lambda t: (t.harky[0], t.zobrazenie)):
+        zoz = po_tagu.get(t.kluc, [])
+        pocet = sum(1 for v in zoz if v.stav in {"auto", "potvrdené"})
+        kontr = sum(1 for v in zoz if v.stav == "na kontrolu")
+        if not pocet and not kontr:
+            continue
+        for harok in t.harky:
+            nazov = t.zobrazenie
+            if readme_v_priecinkoch:
+                nazov = _md_odkaz(t.zobrazenie, zlozka(t, harok) / "README.md", koren)
+            r.append(f"| {_md(harok)} | {nazov if readme_v_priecinkoch else _md(nazov)} | {pocet} | {kontr} |")
+    bez = sorted(t.zobrazenie for t in tagy.values()
+                 if not any(v.stav in {"auto", "potvrdené"} for v in po_tagu.get(t.kluc, [])))
+    r += ["", "## Dokumenty", "", "| Dokument | Stav čítania | OCR | Tagy |", "|---|---|---|---|"]
+    for d in sorted(dokumenty.values(), key=lambda d: d.nazov.lower()):
+        tagy_d = sorted(tagy[v.kluc].zobrazenie for v in pripojene_v if v.hash == d.hash)
+        ciel = d.ulozene or d.zdroje[0]
+        r.append(f"| {_md_odkaz(d.nazov, ciel, koren)} | {_md(d.stav)} | {_md(d.ocr_motor)} | "
+                 f"{_md(', '.join(tagy_d)) or '–'} |")
+    r += ["", f"## Tagy bez dokumentov ({len(bez)})", "", _md(", ".join(bez)) or "–", ""]
+    zmenene += _zapis_ak_iny(koren / "PREHLAD.md", "\n".join(r))
+    return zmenene
 
 # ---------------------------------------------------------------------------- Excel
 
@@ -1097,17 +1510,21 @@ def zapis_protokol(cesta: Path, n: Nastavenia, tagy, dokumenty, vazby, plan, suh
 
     # Dokumenty
     ws = wb.create_sheet("Dokumenty")
-    ws.append(["Dokument", "Stav čítania", "Strany bez textu (OCR)", "Počet tagov", "Kópií v zdrojoch",
-               "Zdrojové cesty", "Uložené ako", "Chyba", "SHA-256"])
+    ws.append(["Dokument", "Stav čítania", "Strany bez textu", "OCR strany", "OCR motor", "Počet tagov",
+               "Kópií v zdrojoch", "Zdrojové cesty", "Uložené ako", "Prehľadávateľné PDF", "Chyba", "SHA-256"])
     tagov_v_dok = defaultdict(int)
     for v in vazby.values():
         if v.stav in {"auto", "potvrdené"}:
             tagov_v_dok[v.hash] += 1
     for d in sorted(dokumenty.values(), key=lambda d: d.nazov.lower()):
-        ws.append([d.nazov, d.stav, ", ".join(d.strany_bez_textu), tagov_v_dok[d.hash], len(d.zdroje),
-                   "\n".join(str(z) for z in d.zdroje), _rel(d.ulozene, cesta.parent) if d.ulozene else "",
+        orig = d.ulozene_original or d.ulozene
+        ws.append([d.nazov, d.stav, ", ".join(d.strany_bez_textu),
+                   ", ".join(sorted(d.ocr_strany, key=lambda s: (len(s), s))), d.ocr_motor,
+                   tagov_v_dok[d.hash], len(d.zdroje), "\n".join(str(z) for z in d.zdroje),
+                   _rel(orig, cesta.parent) if orig else "",
+                   _rel(d.ulozene, cesta.parent) if d.ulozene and d.ulozene != orig else "",
                    d.chyba, d.hash])
-    _formatuj(ws, [42, 15, 20, 12, 15, 70, 50, 50, 20])
+    _formatuj(ws, [42, 15, 16, 12, 12, 12, 15, 70, 50, 50, 50, 20])
 
     # Tagy bez dokumentov / MasterData
     ws = wb.create_sheet("Odkazy")
@@ -1143,6 +1560,9 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     n = nacitaj_nastavenia(Path(a.config).resolve())
+    if n.vystup.name == "ukazka_vystupu" and not all(
+            "demo_data" in p.parts for p in [n.masterdata, *n.zdroje]):
+        raise SystemExit("Priečinok ukazka_vystupu sa nahráva na GitHub – smie obsahovať IBA fiktívne demo_data.")
     n.vystup.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(message)s",
                         handlers=[logging.StreamHandler(sys.stdout),
@@ -1165,7 +1585,11 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Súborov: %d | unikátnych dokumentov: %d | ignorovaných typov: %d", suborov, len(dokumenty), ignorovane)
 
         texty = extrahuj(dokumenty, cache, n)
-        vazby = paruj(dokumenty, texty, parovac, tagy, n.zdroje)
+        ocr = Ocr(n.ocr)
+        nove_ocr = spusti_ocr(dokumenty, texty, cache, ocr, n)
+        treba_zameny = n.ocr.oprava_zamien and any(d.ocr_strany for d in dokumenty.values())
+        parovac_ocr = parovac_zamen(tagy, n) if treba_zameny else None
+        vazby = paruj(dokumenty, texty, parovac, tagy, n.zdroje, parovac_ocr)
         rozhodnutia = nacitaj_rozhodnutia(n.vystup / "kontrola.xlsx")
         aplikuj_rozhodnutia(vazby, rozhodnutia)
 
@@ -1180,6 +1604,9 @@ def main(argv: list[str] | None = None) -> int:
         vytvorene = zmazane = 0
         if a.ostro:
             vytvorene, zmazane = synchronizuj_odkazy(plan, n, vsetky)
+            md = zapis_markdown(n, tagy, dokumenty, vazby, zvol_typ_odkazu(n) == "markdown")
+            if zvol_typ_odkazu(n) == "markdown":
+                vytvorene = md
 
         # súhrn
         stavy = defaultdict(int)
@@ -1204,6 +1631,8 @@ def main(argv: list[str] | None = None) -> int:
             ("Unikátnych dokumentov (podľa obsahu)", len(dokumenty)),
             ("Duplicitné kópie v zdrojoch", suborov - len(dokumenty)),
             ("Ignorované (nepodporovaný typ)", ignorovane),
+            ("OCR", ocr.popis),
+            ("OCR: dokumenty spracované v tomto behu (ostatné z cache)", nove_ocr),
             ("Dokumenty bez tagu (ostali iba v zdroji)", len(dokumenty) - len({v.hash for v in vazby.values()})),
             *[(f"Stav čítania: {k}", v) for k, v in sorted(stavy.items())],
             ("■ Väzby tag ↔ dokument", ""),

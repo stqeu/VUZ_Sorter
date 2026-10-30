@@ -1,11 +1,11 @@
 # Čo ďalej
 
-## 1. OCR (ďalší krok)
-- Strany označené *potrebuje OCR* / *čiastočne OCR* spracovať lokálne – nič neodchádza mimo počítača.
-- Tlačené skeny: **OCRmyPDF + Tesseract** (`slk+ces+eng`).
-- Rukopisy: **Ollama + Qwen2.5-VL 7B / Qwen3-VL 8B** na RTX 3070 – pýtať sa iba na Tag No,
+## 1. OCR
+- ✅ Tlačené skeny: **OCRmyPDF + Tesseract** (`slk+ces+eng`), cache, prehľadávateľné PDF, oprava zámen (v0.2).
+- ✅ Realistické demo skeny + ukážka výsledku na GitHube (`ukazka_vystupu/`).
+- ⏳ Test OCR v CI (inštalácia Tesseractu v GitHub Actions).
+- ⏳ Rukopisy: **Ollama + Qwen2.5-VL 7B / Qwen3-VL 8B** na RTX 3070 – pýtať sa iba na Tag No,
   výsledok overiť voči MasterData, nízka istota → `kontrola.xlsx`.
-- OCR text uložiť do cache rovnako ako bežný text (podľa SHA-256), aby sa OCR robilo iba raz.
 
 ## 2. Rovnaké názvy, rôzny obsah
 - Pri kolízii názvov v jednom priečinku tagu dať čitateľný názov obom odkazom

@@ -244,7 +244,129 @@ def subory():
     (ZDROJ / "rozne" / "vykres_11E101.dwg").write_bytes(b"AC1027 fiktivny vykres")
 
 
+# ---------------------------------------------------------------------------- realistické skeny (OCR)
+def _font(velkost: int):
+    from PIL import ImageFont
+    for f in ("C:/Windows/Fonts/arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              "/System/Library/Fonts/Supplemental/Arial.ttf"):
+        if Path(f).exists():
+            return ImageFont.truetype(f, velkost)
+    return ImageFont.load_default()
+
+
+def _sken_strana(riadky: list[str], uhol: float = 0.0, otocit_90: bool = False, dpi: int = 250):
+    """A4 strana ako zo skenera: písmo ~11 pt, mierne natočenie, šum, sivé pozadie, jemné rozmazanie."""
+    import random
+    from PIL import Image, ImageDraw, ImageFilter
+    random.seed(len("".join(riadky)))
+    w, h = int(8.27 * dpi), int(11.69 * dpi)
+    img = Image.new("L", (w, h), 248)
+    d = ImageDraw.Draw(img)
+    font = _font(int(dpi * 11 / 72))
+    nadpis = _font(int(dpi * 15 / 72))
+    y = int(1.2 * dpi)
+    for i, r in enumerate(riadky):
+        d.text((int(1.0 * dpi), y), r, fill=25, font=nadpis if i == 0 else font)
+        y += int(dpi * (0.42 if i == 0 else 0.30))
+    if otocit_90:
+        img = img.rotate(90, expand=True, fillcolor=248)
+    img = img.rotate(uhol, resample=Image.BICUBIC, expand=False, fillcolor=248)
+    px = img.load()
+    for _ in range(w * h // 900):                      # šum (prach zo skenera)
+        x, yy = random.randrange(img.width), random.randrange(img.height)
+        px[x, yy] = random.choice((120, 180, 255))
+    return img.filter(ImageFilter.GaussianBlur(0.6))
+
+
+def _pdf_zo_stran(cesta: Path, strany: list):
+    """Strany = PIL obrázok (sken) alebo str (digitálny text). Výsledok: PDF bez textovej vrstvy pri skenoch."""
+    import io
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfgen import canvas
+    font = "Helvetica"
+    for kandidat in ("C:/Windows/Fonts/arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        if Path(kandidat).exists():
+            pdfmetrics.registerFont(TTFont("Uni", kandidat))
+            font = "Uni"
+            break
+    c = canvas.Canvas(str(cesta), pagesize=A4, invariant=1)
+    for s in strany:
+        if isinstance(s, str):
+            c.setPageSize(A4)
+            y = 790
+            for i, r in enumerate(s.splitlines()):
+                c.setFont(font, 15 if i == 0 else 11)
+                c.drawString(60, y, r)
+                y -= 22 if i == 0 else 16
+        else:
+            velkost = landscape(A4) if s.width > s.height else A4
+            c.setPageSize(velkost)
+            buf = io.BytesIO()
+            s.save(buf, "JPEG", quality=55)
+            buf.seek(0)
+            c.drawImage(ImageReader(buf), 0, 0, width=velkost[0], height=velkost[1])
+        c.showPage()
+    c.save()
+
+
+def skeny():
+    """Realistické skeny na test OCR (fiktívny obsah). Nemení ostatné demo súbory."""
+    from PIL import Image, ImageDraw, ImageFilter
+    ciel = ZDROJ / "skeny"
+    ciel.mkdir(parents=True, exist_ok=True)
+
+    # A) 2-stranový sken revíznej správy – tag, rozsah, ďalší tag; mierne natočený
+    _pdf_zo_stran(ciel / "Revizia_vymennikov_sken_2019.pdf", [
+        _sken_strana(["REVÍZNA SPRÁVA č. 47/2019 (FIKTÍVNA – DEMO)",
+                      "Prevádzkovateľ: Demo rafinéria, a. s.",
+                      "Techn. označenie: 11E101",
+                      "Názov TZ: Výmenník tepla rúrkový",
+                      "Rok výroby: 1976        Skupina: A/b",
+                      "Výsledok revízie: vyhovuje"], uhol=1.2),
+        _sken_strana(["Pokračovanie – strana 2",
+                      "Vnútorná prehliadka vzduchových chladičov 11A101A-C bez nálezu.",
+                      "Tlaková skúška výmenníka 11E102 – vyhovuje.",
+                      "Hrúbky stien merané ultrazvukom, minimum 6,2 mm."], uhol=-0.8),
+    ])
+
+    # B) zmiešané PDF: strana 1 digitálny text, strana 2 sken (čiastočné OCR)
+    #    zámerná chyba v zápise 11VI09B (písmeno I namiesto 1) -> ukážka „OCR oprava“ na kontrolu
+    _pdf_zo_stran(ciel / "Zmiesany_protokol_oprava_2021.pdf", [
+        "PROTOKOL O OPRAVE (FIKTÍVNY – DEMO)\nTextová strana vytvorená v PC.\n"
+        "Opravované zariadenie: kolóna 11C101\nDátum opravy: 14. 6. 2021",
+        _sken_strana(["Príloha – naskenovaný formulár",
+                      "Vymenené tesnenie príruby na nádobe 11VI09B",
+                      "(v pôvodnom zápise je písmeno I namiesto jednotky)",
+                      "Kontrola zásobníka 11D101 bez nálezu."], uhol=0.6),
+    ])
+
+    # C) sken otočený o 90° (OCRmyPDF ho narovná – --rotate-pages)
+    _pdf_zo_stran(ciel / "Kalibracia_otoceny_sken_2018.pdf", [
+        _sken_strana(["KALIBRAČNÝ LIST (FIKTÍVNY – DEMO)",
+                      "Filter 11F150A1 – snímač tlakovej diferencie",
+                      "Dátum kalibrácie: 3. 4. 2018",
+                      "Výsledok: v tolerancii"], otocit_90=True),
+    ])
+
+    # D) fotka výrobného štítku (obrázok, bez tagu v názve)
+    img = Image.new("RGB", (1800, 1100), (128, 122, 110))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((180, 160, 1620, 940), radius=30, fill=(214, 214, 206), outline=(90, 90, 90), width=6)
+    for (x, y), t, f in (((260, 230), "VÝROBNÝ ŠTÍTOK", _font(80)), ((260, 400), "Čerpadlo 11P110B", _font(96)),
+                         ((260, 560), "Q = 25 m3/h    H = 48 m", _font(64)),
+                         ((260, 680), "Rok výroby: 1981  (DEMO)", _font(64))):
+        d.text((x, y), t, fill=(30, 30, 30), font=f)
+    img = img.rotate(-3, resample=Image.BICUBIC, fillcolor=(128, 122, 110)).filter(ImageFilter.GaussianBlur(1.0))
+    img.save(ciel / "foto_stitok_cerpadla.jpg", "JPEG", quality=80)
+
+
 if __name__ == "__main__":
-    masterdata()
-    subory()
+    import sys
+    if "--iba-skeny" not in sys.argv:
+        masterdata()
+        subory()
+    skeny()
     print("Demo dáta vytvorené v", TU)
