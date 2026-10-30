@@ -24,6 +24,11 @@
 !requirements.txt
 !demo_data/**
 
+# ukážkový výstup z FIKTÍVNYCH demo dát (UKAZKA.bat) – zobrazuje sa na GitHube
+!ukazka_vystupu/**
+ukazka_vystupu/.cache/
+ukazka_vystupu/*.log
+
 # reálne konfigurácie (cesty na OneDrive, názvy projektov)
 config/*.local.ini
 

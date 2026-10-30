@@ -29,6 +29,25 @@ vystup/
   .cache/                          SQLite cache (hash + text), zoznam vytvorených odkazov
 ```
 
+## OCR
+
+- Na OCR idú iba dokumenty so stavom *potrebuje OCR* / *čiastočne OCR* a iba ich strany bez textu.
+- PDF: **OCRmyPDF** → prehľadávateľné PDF (`_dokumenty/<názov>__<hash8>.ocr.pdf`), odkazy pri tagoch vedú naň;
+  originál ostáva vedľa. Bez OCRmyPDF: strany sa vykreslia a prečíta ich priamo Tesseract (iba text).
+- Obrázky (`.jpg`, `.png`, `.tif`): Tesseract.
+- Zhody z OCR textu majú v indexe typ doplnený o *z OCR* a platia pre ne rovnaké pravidlá 1 – 7.
+- **Oprava zámen:** ak tag v OCR texte nesedí presne, skúsi sa porovnanie po zjednotení zameniteľných znakov
+  (O/0, C/0, D/0, Q/0, I/1, l/1, S/5, B/8, Z/2, G/6, £/E, €/E). Takáto zhoda má typ *OCR oprava* a ide **vždy na kontrolu**.
+  Ak sa text dá zjednotiť na viac tagov (napr. `110101` → 11C101 aj 11D101), na kontrolu idú všetci kandidáti.
+- Výsledky OCR sú v cache podľa SHA-256; zmena jazykov v `[ocr]` spôsobí nové OCR.
+
+## Markdown výstup (GitHub)
+
+Pri `typ_odkazu = markdown` sa namiesto skratiek vytvorí v každom priečinku zariadenia `README.md`
+(tabuľka dokumentov s odkazmi do `_dokumenty`, strany, typ zhody, nájdený text, sekcia *Čaká na kontrolu*)
+a vo výstupe `PREHLAD.md` (súhrn, zariadenia, dokumenty, tagy bez dokumentov). `PREHLAD.md` vzniká pri
+každom ostrom behu. Ukážka: [ukazka_vystupu/PREHLAD.md](../ukazka_vystupu/PREHLAD.md).
+
 ## Identifikácia dokumentov
 
 Každý dokument je identifikovaný **SHA-256 odtlačkom obsahu** – nie názvom.
@@ -48,7 +67,7 @@ Každý dokument je identifikovaný **SHA-256 odtlačkom obsahu** – nie názvo
 
 ## Známe obmedzenia demo verzie
 
-- **OCR** zatiaľ nie je – súbory sú v protokole označené „potrebuje OCR“ / „čiastočne OCR“ so zoznamom strán.
+- **Rukopis** Tesseract prečíta zle – na rukopisy je v pláne lokálny model (Qwen-VL cez Ollama).
 - `.doc` potrebuje nainštalovaný MS Word a `pip install pywin32`.
 - Odkazy .lnk obsahujú absolútnu cestu – po presune priečinka `vystup` stačí spustiť skript znova.
 - Veľmi dlhé cesty (> 260 znakov, OneDrive) môže Windows odmietnuť – výstup dávaj čo najplytšie.

@@ -1,0 +1,4 @@
+Meranie hrúbok:
+TBP-0279-DN80-A1B  min 4,1 mm
+11-N2-0,6-1285-DN100-A1B  min 3,8 mm
+Potrubný rozvod A/e-KSO – vizuálna kontrola OK
